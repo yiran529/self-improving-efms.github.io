@@ -1,0 +1,30 @@
+[project]
+name = "self-improving-efms-github-io"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "dm-env>=1.6",
+    "dm-haiku>=0.0.16",
+    "ipykernel>=7.2.0",
+    "jax==0.7.2",
+    "matplotlib==3.10.0",
+    "mediapy>=1.2.6",
+    "moviepy==2.0.0",
+    "numpy==2.1.0",
+    "optax==0.2.7",
+    "pillow>=10.4.0,<11.0.0",
+    "tensorflow==2.19.0",
+    "tf-keras==2.19.*",
+    "tfp-nightly[jax]>=0.26.0.dev20260222",
+]
+
+[project.optional-dependencies]
+gpu = [
+    "jax[cuda12]==0.7.2",
+]
+
+[build-system]
+requires = ["uv_build>=0.10.4,<0.11.0"]
+build-backend = "uv_build"
