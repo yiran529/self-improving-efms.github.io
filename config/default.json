@@ -1,0 +1,53 @@
+{
+  "seed": 42,
+  "device": "auto",
+  "paths": {
+    "data_dir": "artifacts/data",
+    "ckpt_dir": "artifacts/checkpoints",
+    "log_dir": "artifacts/logs",
+    "dataset_file": "pointmass_dataset.pkl",
+    "sft_ckpt": "sft_last.pt",
+    "self_improve_ckpt": "self_improve_last.pt"
+  },
+  "env": {
+    "bounds_x": [-1.0, 1.0],
+    "bounds_y": [-1.0, 1.0],
+    "physics_substeps": 10,
+    "success_radius": 0.15
+  },
+  "dataset": {
+    "num_episodes": 2000,
+    "num_waypoints_per_episode": 5,
+    "episode_len_discard_thresh": 10
+  },
+  "distance": {
+    "min_distance": 0.0,
+    "max_distance": 140.0,
+    "num_bins": 50
+  },
+  "model": {
+    "hidden_sizes": [256, 256, 256],
+    "min_act_scale": 0.01
+  },
+  "stage1": {
+    "batch_size": 256,
+    "num_updates": 1000,
+    "eval_interval": 50,
+    "learning_rate": 0.0003,
+    "weight_decay": 0.0,
+    "train_ratio": 0.9
+  },
+  "stage2": {
+    "learning_rate": 0.0003,
+    "weight_decay": 0.0,
+    "num_iterations": 128,
+    "env_steps_per_batch": 2048,
+    "minibatch_size": 64,
+    "gamma": 0.9
+  },
+  "eval": {
+    "num_episodes": 25,
+    "max_steps": 140,
+    "deterministic_action": false
+  }
+}
