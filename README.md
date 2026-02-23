@@ -113,6 +113,7 @@ python scripts/run_generate_data.py --config config/default.json
 python scripts/run_train_sft.py --config config/default.json
 python scripts/run_train_self_improve.py --config config/default.json
 python scripts/run_evaluate.py --config config/default.json
+python scripts/run_visualizations.py --config config/default.json
 ```
 
 ## 一键全流程
@@ -149,5 +150,7 @@ python scripts/run_all.py --config config/default.json --skip-generate --skip-sf
 - Dataset 视频：`artifacts/videos/dataset_trajectories.mp4`
 - Stage1 视频：`artifacts/videos/stage1_trajectories.mp4`
 - Stage2 视频：`artifacts/videos/stage2_trajectories.mp4`
+
+若当前环境的 `ffmpeg` 不可用，程序会自动回退并生成同名 `.gif` 动图。
 
 可在 `config/default.json` 中统一修改路径和超参数。

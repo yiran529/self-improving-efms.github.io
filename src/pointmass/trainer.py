@@ -919,10 +919,21 @@ def _write_video_file(
     if len(frames) == 0:
         raise ValueError("No frames to write.")
     output_video_path.parent.mkdir(parents=True, exist_ok=True)
-    with imageio.get_writer(str(output_video_path), fps=fps) as writer:
-        for frame in frames:
-            writer.append_data(frame.astype(np.uint8))
-    return output_video_path
+    uint8_frames = [frame.astype(np.uint8) for frame in frames]
+    try:
+        with imageio.get_writer(str(output_video_path), fps=fps) as writer:
+            for frame in uint8_frames:
+                writer.append_data(frame)
+        return output_video_path
+    except Exception as exc:
+        # Fallback for environments where imageio_ffmpeg cannot locate a valid ffmpeg binary.
+        fallback_path = output_video_path.with_suffix(".gif")
+        print(
+            "[Visualize] mp4 writer failed; fallback to gif. "
+            f"reason={type(exc).__name__}: {exc}. output={fallback_path}"
+        )
+        imageio.mimsave(str(fallback_path), uint8_frames, duration=max(1.0 / float(fps), 1e-3), loop=0)
+        return fallback_path
 
 
 def generate_dataset_trajectory_video(
