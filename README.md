@@ -19,7 +19,8 @@
 │  ├─ run_generate_data.py
 │  ├─ run_train_sft.py
 │  ├─ run_train_self_improve.py
-│  └─ run_evaluate.py
+│  ├─ run_evaluate.py
+│  └─ run_all.py
 └─ pointmass_notebook.py
 ```
 
@@ -83,6 +84,26 @@ python pointmass_notebook.py --config config/default.json evaluate
 python pointmass_notebook.py --config config/default.json evaluate --deterministic-action
 ```
 
+### 5) 轨迹视频可视化（仅生成视频，不弹窗）
+
+数据轨迹视频：
+
+```bash
+python pointmass_notebook.py --config config/default.json visualize-dataset
+```
+
+Stage1 策略轨迹视频：
+
+```bash
+python pointmass_notebook.py --config config/default.json visualize-stage1
+```
+
+Stage2 策略轨迹视频：
+
+```bash
+python pointmass_notebook.py --config config/default.json visualize-stage2
+```
+
 ## scripts 入口（可选）
 
 与上面命令等价：
@@ -96,7 +117,7 @@ python scripts/run_evaluate.py --config config/default.json
 
 ## 一键全流程
 
-按默认配置串行执行：数据生成 -> Stage1 -> Stage2 -> 评估。
+按默认配置串行执行：数据生成 -> 数据可视化 -> Stage1 -> Stage1可视化 -> Stage2 -> Stage2可视化 -> 评估。
 
 ```bash
 python scripts/run_all.py --config config/default.json
@@ -106,6 +127,12 @@ python scripts/run_all.py --config config/default.json
 
 ```bash
 python scripts/run_all.py --config config/default.json --num-episodes 100 --sft-updates 200 --self-improve-iters 20 --eval-episodes 10
+```
+
+可覆盖视频参数：
+
+```bash
+python scripts/run_all.py --config config/default.json --vis-episodes 5 --vis-fps 10 --vis-max-steps 140
 ```
 
 跳过某些阶段：
@@ -119,5 +146,8 @@ python scripts/run_all.py --config config/default.json --skip-generate --skip-sf
 - 数据：`artifacts/data/pointmass_dataset.pkl`
 - Stage1 checkpoint：`artifacts/checkpoints/sft_last.pt`
 - Stage2 checkpoint：`artifacts/checkpoints/self_improve_last.pt`
+- Dataset 视频：`artifacts/videos/dataset_trajectories.mp4`
+- Stage1 视频：`artifacts/videos/stage1_trajectories.mp4`
+- Stage2 视频：`artifacts/videos/stage2_trajectories.mp4`
 
 可在 `config/default.json` 中统一修改路径和超参数。

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import random
 from pathlib import Path
 from typing import Dict
@@ -29,7 +28,7 @@ def resolve_device(device_cfg: str):
 
 
 def ensure_dirs(paths_cfg: Dict[str, str]) -> None:
-    for key in ("data_dir", "ckpt_dir", "log_dir"):
+    for key in ("data_dir", "ckpt_dir", "log_dir", "video_dir"):
         if key in paths_cfg:
             Path(paths_cfg[key]).mkdir(parents=True, exist_ok=True)
 

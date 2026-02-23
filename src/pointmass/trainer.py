@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from .env import Point2D, Point2DConfig, pd_controller
 from .model import TimerNet
-from .utils import ensure_dirs, path_from_cfg, resolve_device, seed_everything
+from .utils import ensure_dirs, resolve_device, seed_everything
 
 
 def build_env_from_cfg(cfg: Mapping[str, Any]) -> Point2D:
@@ -398,6 +398,44 @@ def load_checkpoint(
     return ckpt
 
 
+# DEBUG: utility to fail fast when numpy arrays contain NaN/Inf during stage2 diagnostics.
+def _assert_finite_np(name: str, arr: np.ndarray) -> None:
+    finite_mask = np.isfinite(arr)
+    if finite_mask.all():
+        return
+    bad_count = int((~finite_mask).sum())
+    total_count = int(arr.size)
+    raise ValueError(
+        f"[DEBUG] Non-finite numpy array detected: {name}, "
+        f"bad={bad_count}/{total_count}, shape={arr.shape}, dtype={arr.dtype}, "
+        f"min={np.nanmin(arr)}, max={np.nanmax(arr)}"
+    )
+
+
+# DEBUG: utility to fail fast when torch tensors contain NaN/Inf during stage2 diagnostics.
+def _assert_finite_torch(name: str, tensor: torch.Tensor) -> None:
+    finite_mask = torch.isfinite(tensor)
+    if bool(torch.all(finite_mask)):
+        return
+    bad_count = int((~finite_mask).sum().item())
+    total_count = int(tensor.numel())
+    t_cpu = tensor.detach().float().cpu()
+    raise ValueError(
+        f"[DEBUG] Non-finite tensor detected: {name}, "
+        f"bad={bad_count}/{total_count}, shape={tuple(tensor.shape)}, dtype={tensor.dtype}, "
+        f"min={torch.nan_to_num(t_cpu, nan=0.0, posinf=0.0, neginf=0.0).min().item()}, "
+        f"max={torch.nan_to_num(t_cpu, nan=0.0, posinf=0.0, neginf=0.0).max().item()}"
+    )
+
+
+# DEBUG: utility to fail fast when model parameters or gradients become NaN/Inf.
+def _assert_model_finite(model: TimerNet, tag: str) -> None:
+    for name, param in model.named_parameters():
+        _assert_finite_torch(f"{tag}:param:{name}", param.data)
+        if param.grad is not None:
+            _assert_finite_torch(f"{tag}:grad:{name}", param.grad)
+
+
 def run_sft_training(
     cfg: Mapping[str, Any],
     dataset_path: Path,
@@ -438,6 +476,7 @@ def run_sft_training(
         model.parameters(),
         lr=float(cfg["stage1"]["learning_rate"]),
         weight_decay=float(cfg["stage1"]["weight_decay"]),
+        eps=1e-7,
     )
 
     if resume_ckpt_path is not None and resume_ckpt_path.exists():
@@ -490,13 +529,26 @@ def _predict_action_and_distance(
     device: torch.device,
     deterministic: bool = False,
 ) -> Tuple[np.ndarray, float]:
+    # DEBUG: assert normalized observation is finite before model forward.
+    _assert_finite_np("rollout_obs_vec_norm", obs_vec_norm)
     obs_t = torch.from_numpy(obs_vec_norm[None, :]).to(device=device, dtype=torch.float32)
     with torch.no_grad():
         loc, scale, logits = model(obs_t)
+        # DEBUG: assert forward outputs are finite to localize NaN source in rollout.
+        _assert_finite_torch("rollout_loc", loc)
+        _assert_finite_torch("rollout_scale", scale)
+        _assert_finite_torch("rollout_logits", logits)
         act_dist = Independent(Normal(loc, scale), 1)
         norm_action = loc if deterministic else act_dist.sample()
+        # DEBUG: assert sampled normalized action is finite before environment step.
+        _assert_finite_torch("rollout_norm_action", norm_action)
         pred_dist = converter.logits_to_expected_distance(logits).item()
+    # DEBUG: assert predicted distance is finite before reward-shaping computations.
+    if not np.isfinite(pred_dist):
+        raise ValueError(f"[DEBUG] Non-finite predicted distance detected: {pred_dist}")
     action = norm_action[0].detach().cpu().numpy().astype(np.float32)
+    # DEBUG: assert output action vector is finite.
+    _assert_finite_np("rollout_action_np", action)
     return action, float(pred_dist)
 
 
@@ -512,6 +564,7 @@ def generate_reinforce_dataset(
 ) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]:
     model.eval()
     total_steps = 0
+    invalid_episode_count = 0
     all_obs: List[np.ndarray] = []
     all_actions: List[np.ndarray] = []
     all_weights: List[np.ndarray] = []
@@ -524,11 +577,14 @@ def generate_reinforce_dataset(
 
         obs = env.reset()
         obs_vec = norm_stats.normalize_obs_single_to_vector(obs)
+        # DEBUG: assert normalized initial observation is finite for each rollout.
+        _assert_finite_np("episode_obs_vec_init", obs_vec)
         traj_obs.append(obs_vec)
 
         episode_return = 0.0
         steps = 0
         done = env.success()
+        episode_valid = True
 
         while (not done) and steps < max_steps:
             norm_action, pred_dist = _predict_action_and_distance(
@@ -539,14 +595,41 @@ def generate_reinforce_dataset(
                 deterministic=False,
             )
             action = norm_stats.unnormalize_action_np(norm_action[None, :])[0]
+            # DEBUG: assert unnormalized action is finite before stepping environment.
+            _assert_finite_np("episode_action_unnorm", action)
             traj_act.append(norm_action)
             traj_dist_pred.append(pred_dist)
 
             obs, reward, done = env.step(action)
+            # DEBUG: discard rollout episode when environment transition becomes non-finite.
+            if (
+                (not np.isfinite(reward))
+                or (not np.isfinite(obs["cur_pos"]).all())
+                or (not np.isfinite(obs["cur_vel"]).all())
+                or (not np.isfinite(obs["goal_pos"]).all())
+            ):
+                invalid_episode_count += 1
+                print(
+                    "[DEBUG] Discarding episode due to non-finite env transition: "
+                    f"reward={reward}, step={steps}, invalid_episodes={invalid_episode_count}"
+                )
+                episode_valid = False
+                break
             episode_return += float(reward)
             steps += 1
             obs_vec = norm_stats.normalize_obs_single_to_vector(obs)
+            # DEBUG: assert normalized observation is finite at each step.
+            _assert_finite_np("episode_obs_vec_step", obs_vec)
             traj_obs.append(obs_vec)
+
+        # DEBUG: skip invalid episodes to prevent non-finite rollout data entering training.
+        if not episode_valid:
+            if invalid_episode_count >= 1000:
+                raise RuntimeError(
+                    "[DEBUG] Too many invalid rollout episodes (>=1000). "
+                    "Stage2 policy likely diverged; reduce stage2 LR or restart from earlier checkpoint."
+                )
+            continue
 
         if steps < 1:
             continue
@@ -558,11 +641,28 @@ def generate_reinforce_dataset(
             device=device,
             deterministic=False,
         )
+        # DEBUG: skip episode when final distance prediction is non-finite.
+        if not np.isfinite(final_dist):
+            invalid_episode_count += 1
+            print(
+                "[DEBUG] Discarding episode due to non-finite final distance prediction: "
+                f"final_dist={final_dist}, invalid_episodes={invalid_episode_count}"
+            )
+            if invalid_episode_count >= 1000:
+                raise RuntimeError(
+                    "[DEBUG] Too many invalid rollout episodes (>=1000). "
+                    "Stage2 policy likely diverged; reduce stage2 LR or restart from earlier checkpoint."
+                )
+            continue
         traj_dist_pred.append(final_dist)
 
         traj_obs_arr = np.stack(traj_obs, axis=0).astype(np.float32)
         traj_act_arr = np.stack(traj_act, axis=0).astype(np.float32)
         traj_dist = np.asarray(traj_dist_pred, dtype=np.float32)
+        # DEBUG: assert trajectory arrays are finite before computing weights.
+        _assert_finite_np("traj_obs_arr", traj_obs_arr)
+        _assert_finite_np("traj_act_arr", traj_act_arr)
+        _assert_finite_np("traj_dist", traj_dist)
 
         rews = -1.0 * (traj_dist[1:] - traj_dist[:-1])
         discounted = np.zeros_like(rews, dtype=np.float32)
@@ -570,6 +670,8 @@ def generate_reinforce_dataset(
         for i in range(rews.shape[0] - 1, -1, -1):
             running = rews[i] + float(gamma) * running
             discounted[i] = running
+        # DEBUG: assert REINFORCE weights are finite before batching.
+        _assert_finite_np("traj_discounted_weights", discounted)
 
         all_obs.append(traj_obs_arr[:-1])
         all_actions.append(traj_act_arr)
@@ -583,10 +685,26 @@ def generate_reinforce_dataset(
                 "len": float(steps),
             }
         )
+        invalid_episode_count = 0
 
     obs_arr = np.concatenate(all_obs, axis=0)[:num_steps]
     act_arr = np.concatenate(all_actions, axis=0)[:num_steps]
     weight_arr = np.concatenate(all_weights, axis=0)[:num_steps]
+    # DEBUG: filter non-finite rows in reinforce dataset to keep optimizer inputs valid.
+    finite_mask = (
+        np.isfinite(obs_arr).all(axis=1)
+        & np.isfinite(act_arr).all(axis=1)
+        & np.isfinite(weight_arr)
+    )
+    dropped = int((~finite_mask).sum())
+    if dropped > 0:
+        print(f"[DEBUG] Dropping non-finite reinforce samples: dropped={dropped}, total={finite_mask.shape[0]}")
+    obs_arr = obs_arr[finite_mask]
+    act_arr = act_arr[finite_mask]
+    weight_arr = weight_arr[finite_mask]
+    # DEBUG: assert there are valid reinforce samples left after filtering.
+    if obs_arr.shape[0] == 0:
+        raise ValueError("[DEBUG] All REINFORCE samples are non-finite after filtering.")
 
     if len(episode_stats) == 0:
         raise RuntimeError("No REINFORCE trajectories generated. Check environment and policy.")
@@ -604,11 +722,24 @@ def _compute_reinforce_loss(
     weight: torch.Tensor,
     max_steps: int,
 ) -> torch.Tensor:
+    # DEBUG: assert reinforce minibatch inputs are finite before forward.
+    _assert_finite_torch("reinforce_obs_batch", obs)
+    _assert_finite_torch("reinforce_action_batch", action)
+    _assert_finite_torch("reinforce_weight_batch", weight)
     loc, scale, _ = model(obs)
+    # DEBUG: assert reinforce forward outputs are finite before constructing distributions.
+    _assert_finite_torch("reinforce_loc", loc)
+    _assert_finite_torch("reinforce_scale", scale)
     act_dist = Independent(Normal(loc, scale), 1)
     log_prob = act_dist.log_prob(action)
+    # DEBUG: assert log-probabilities are finite before loss reduction.
+    _assert_finite_torch("reinforce_log_prob", log_prob)
     scaled_weight = weight / float(max_steps)
+    # DEBUG: assert scaled reinforce weights are finite.
+    _assert_finite_torch("reinforce_scaled_weight", scaled_weight)
     loss = -1.0 * torch.mean(scaled_weight * log_prob)
+    # DEBUG: assert scalar loss is finite before backward.
+    _assert_finite_torch("reinforce_loss", loss)
     return loss
 
 
@@ -638,9 +769,10 @@ def run_self_improve_training(
         model.parameters(),
         lr=float(cfg["stage2"]["learning_rate"]),
         weight_decay=float(cfg["stage2"]["weight_decay"]),
+        eps=1e-7,
     )
 
-    init_ckpt = load_checkpoint(init_ckpt_path, model=model, optimizer=None, map_location=str(device))
+    init_ckpt = load_checkpoint(init_ckpt_path, model=model, optimizer=optimizer, map_location=str(device))
     norm_stats = NormalizationStats.from_dict(init_ckpt["normalization"])
 
     num_iterations = int(cfg["stage2"]["num_iterations"])
@@ -651,6 +783,8 @@ def run_self_improve_training(
 
     print(f"[Stage2] device={device}, iterations={num_iterations}, env_steps_per_batch={env_steps_per_batch}")
     for it in range(1, num_iterations + 1):
+        # DEBUG: assert model parameters are finite before each rollout-data generation.
+        _assert_model_finite(model, f"iter{it:04d}:before_rollout")
         reinforce_data, ep_stats = generate_reinforce_dataset(
             env=env,
             model=model,
@@ -679,7 +813,11 @@ def run_self_improve_training(
             optimizer.zero_grad(set_to_none=True)
             loss = _compute_reinforce_loss(model, obs, action, weight, max_steps=max_steps)
             loss.backward()
+            # DEBUG: assert gradients are finite immediately after backward.
+            _assert_model_finite(model, f"iter{it:04d}:after_backward")
             optimizer.step()
+            # DEBUG: assert parameters are finite immediately after optimizer step.
+            _assert_model_finite(model, f"iter{it:04d}:after_step")
             losses.append(loss.item())
 
         mean_loss = float(np.mean(losses)) if losses else float("nan")
@@ -769,3 +907,144 @@ def evaluate_policy(
         "len_max": float(np.max(lengths)),
     }
     return result
+
+
+def _write_video_file(
+    frames: Sequence[np.ndarray],
+    output_video_path: Path,
+    fps: int,
+) -> Path:
+    import imageio.v2 as imageio
+
+    if len(frames) == 0:
+        raise ValueError("No frames to write.")
+    output_video_path.parent.mkdir(parents=True, exist_ok=True)
+    with imageio.get_writer(str(output_video_path), fps=fps) as writer:
+        for frame in frames:
+            writer.append_data(frame.astype(np.uint8))
+    return output_video_path
+
+
+def generate_dataset_trajectory_video(
+    cfg: Mapping[str, Any],
+    dataset_path: Path,
+    output_video_path: Path,
+    num_episodes: int,
+    fps: int,
+) -> Path:
+    seed_everything(int(cfg["seed"]))
+    payload = load_dataset(dataset_path)
+    episodes = payload["episodes"]
+    if len(episodes) == 0:
+        raise ValueError("Dataset is empty. Run generate-data first.")
+
+    env = build_env_from_cfg(cfg)
+    episode_count = min(num_episodes, len(episodes))
+    frames: List[np.ndarray] = []
+    for ep_idx in range(episode_count):
+        episode = episodes[ep_idx]
+        points = np.asarray(episode["cur_pos"], dtype=np.float32)
+        goal_pos = np.asarray(episode["goal_pos"][0], dtype=np.float32)
+        for t in range(points.shape[0]):
+            frames.append(env.render(title="Dataset Trajectory", points=points[: t + 1], goal_pos=goal_pos))
+
+    video_path = _write_video_file(frames=frames, output_video_path=output_video_path, fps=fps)
+    print(f"[Visualize][Dataset] saved to: {video_path}")
+    return video_path
+
+
+def _load_policy_from_checkpoint(
+    cfg: Mapping[str, Any],
+    ckpt_path: Path,
+):
+    device = resolve_device(cfg.get("device", "auto"))
+    model = TimerNet(
+        obs_dim=6,
+        act_dim=2,
+        hidden_sizes=tuple(cfg["model"]["hidden_sizes"]),
+        num_distance_bins=int(cfg["distance"]["num_bins"]),
+        min_act_scale=float(cfg["model"]["min_act_scale"]),
+    ).to(device)
+    ckpt = load_checkpoint(ckpt_path, model=model, optimizer=None, map_location=str(device))
+    model.eval()
+    norm_stats = NormalizationStats.from_dict(ckpt["normalization"])
+    converter = DiscreteDistanceConverter.from_dict(ckpt["distance"])
+    return model, norm_stats, converter, device
+
+
+def _generate_policy_trajectory_frames(
+    cfg: Mapping[str, Any],
+    ckpt_path: Path,
+    num_episodes: int,
+    max_steps: int,
+    deterministic_action: bool,
+    title: str,
+) -> List[np.ndarray]:
+    seed_everything(int(cfg["seed"]))
+    env = build_env_from_cfg(cfg)
+    model, norm_stats, converter, device = _load_policy_from_checkpoint(cfg=cfg, ckpt_path=ckpt_path)
+
+    frames: List[np.ndarray] = []
+    for _ in range(num_episodes):
+        obs = env.reset()
+        done = env.success()
+        steps = 0
+        frames.append(env.render(title=title))
+        while (not done) and steps < max_steps:
+            obs_vec = norm_stats.normalize_obs_single_to_vector(obs)
+            norm_action, _ = _predict_action_and_distance(
+                model=model,
+                obs_vec_norm=obs_vec,
+                converter=converter,
+                device=device,
+                deterministic=deterministic_action,
+            )
+            action = norm_stats.unnormalize_action_np(norm_action[None, :])[0]
+            obs, _, done = env.step(action)
+            frames.append(env.render(title=title))
+            steps += 1
+    return frames
+
+
+def generate_stage1_trajectory_video(
+    cfg: Mapping[str, Any],
+    ckpt_path: Path,
+    output_video_path: Path,
+    num_episodes: int,
+    fps: int,
+    max_steps: int,
+    deterministic_action: bool = False,
+) -> Path:
+    frames = _generate_policy_trajectory_frames(
+        cfg=cfg,
+        ckpt_path=ckpt_path,
+        num_episodes=num_episodes,
+        max_steps=max_steps,
+        deterministic_action=deterministic_action,
+        title="Stage1 SFT Policy",
+    )
+    video_path = _write_video_file(frames=frames, output_video_path=output_video_path, fps=fps)
+    print(f"[Visualize][Stage1] saved to: {video_path}")
+    return video_path
+
+
+def generate_stage2_trajectory_video(
+    cfg: Mapping[str, Any],
+    ckpt_path: Path,
+    output_video_path: Path,
+    num_episodes: int,
+    fps: int,
+    max_steps: int,
+    deterministic_action: bool = False,
+) -> Path:
+    frames = _generate_policy_trajectory_frames(
+        cfg=cfg,
+        ckpt_path=ckpt_path,
+        num_episodes=num_episodes,
+        max_steps=max_steps,
+        deterministic_action=deterministic_action,
+        title="Stage2 Self-Improvement Policy",
+    )
+    video_path = _write_video_file(frames=frames, output_video_path=output_video_path, fps=fps)
+    print(f"[Visualize][Stage2] saved to: {video_path}")
+    return video_path

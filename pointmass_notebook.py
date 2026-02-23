@@ -26,6 +26,30 @@ def _resolve_self_improve_ckpt_path(cfg: Dict[str, Any], ckpt_path: Optional[str
     return path_from_cfg(cfg["paths"]["ckpt_dir"], cfg["paths"]["self_improve_ckpt"])
 
 
+def _resolve_video_path(cfg: Dict[str, Any], filename: str, output_path: Optional[str]) -> Path:
+    if output_path is not None:
+        return Path(output_path)
+    video_dir = cfg["paths"].get("video_dir", "artifacts/videos")
+    return path_from_cfg(video_dir, filename)
+
+
+def _get_visualize_defaults(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    vis_cfg = dict(cfg.get("visualization", {}))
+    if "num_episodes" not in vis_cfg:
+        vis_cfg["num_episodes"] = 10
+    if "fps" not in vis_cfg:
+        vis_cfg["fps"] = 10
+    if "max_steps" not in vis_cfg:
+        vis_cfg["max_steps"] = int(cfg["eval"]["max_steps"])
+    if "dataset_video" not in vis_cfg:
+        vis_cfg["dataset_video"] = "dataset_trajectories.mp4"
+    if "stage1_video" not in vis_cfg:
+        vis_cfg["stage1_video"] = "stage1_trajectories.mp4"
+    if "stage2_video" not in vis_cfg:
+        vis_cfg["stage2_video"] = "stage2_trajectories.mp4"
+    return vis_cfg
+
+
 def cmd_generate_data(args: argparse.Namespace) -> None:
     from src.pointmass.trainer import build_env_from_cfg, generate_pd_dataset, save_dataset
 
@@ -138,6 +162,91 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
         print(f"[Eval] {k}={v:.6f}")
 
 
+def cmd_visualize_dataset(args: argparse.Namespace) -> None:
+    from src.pointmass.trainer import generate_dataset_trajectory_video
+
+    cfg = load_config(args.config)
+    ensure_dirs(cfg["paths"])
+    vis_cfg = _get_visualize_defaults(cfg)
+
+    dataset_path = _resolve_dataset_path(cfg, args.dataset_path)
+    if not dataset_path.exists():
+        raise FileNotFoundError(
+            f"Dataset not found at {dataset_path}. Run `generate-data` first or pass --dataset-path."
+        )
+    output_video_path = _resolve_video_path(cfg, vis_cfg["dataset_video"], args.output_video)
+    num_episodes = int(args.num_episodes) if args.num_episodes is not None else int(vis_cfg["num_episodes"])
+    fps = int(args.fps) if args.fps is not None else int(vis_cfg["fps"])
+
+    generate_dataset_trajectory_video(
+        cfg=cfg,
+        dataset_path=dataset_path,
+        output_video_path=output_video_path,
+        num_episodes=num_episodes,
+        fps=fps,
+    )
+
+
+def cmd_visualize_stage1(args: argparse.Namespace) -> None:
+    from src.pointmass.trainer import generate_stage1_trajectory_video
+
+    cfg = load_config(args.config)
+    ensure_dirs(cfg["paths"])
+    vis_cfg = _get_visualize_defaults(cfg)
+
+    ckpt_path = _resolve_sft_ckpt_path(cfg, args.ckpt)
+    if not ckpt_path.exists():
+        raise FileNotFoundError(
+            f"Stage1 checkpoint not found at {ckpt_path}. Run `train-sft` first or pass --ckpt."
+        )
+
+    output_video_path = _resolve_video_path(cfg, vis_cfg["stage1_video"], args.output_video)
+    num_episodes = int(args.num_episodes) if args.num_episodes is not None else int(vis_cfg["num_episodes"])
+    fps = int(args.fps) if args.fps is not None else int(vis_cfg["fps"])
+    max_steps = int(args.max_steps) if args.max_steps is not None else int(vis_cfg["max_steps"])
+    deterministic_action = bool(args.deterministic_action)
+
+    generate_stage1_trajectory_video(
+        cfg=cfg,
+        ckpt_path=ckpt_path,
+        output_video_path=output_video_path,
+        num_episodes=num_episodes,
+        fps=fps,
+        max_steps=max_steps,
+        deterministic_action=deterministic_action,
+    )
+
+
+def cmd_visualize_stage2(args: argparse.Namespace) -> None:
+    from src.pointmass.trainer import generate_stage2_trajectory_video
+
+    cfg = load_config(args.config)
+    ensure_dirs(cfg["paths"])
+    vis_cfg = _get_visualize_defaults(cfg)
+
+    ckpt_path = _resolve_self_improve_ckpt_path(cfg, args.ckpt)
+    if not ckpt_path.exists():
+        raise FileNotFoundError(
+            f"Stage2 checkpoint not found at {ckpt_path}. Run `train-self-improve` first or pass --ckpt."
+        )
+
+    output_video_path = _resolve_video_path(cfg, vis_cfg["stage2_video"], args.output_video)
+    num_episodes = int(args.num_episodes) if args.num_episodes is not None else int(vis_cfg["num_episodes"])
+    fps = int(args.fps) if args.fps is not None else int(vis_cfg["fps"])
+    max_steps = int(args.max_steps) if args.max_steps is not None else int(vis_cfg["max_steps"])
+    deterministic_action = bool(args.deterministic_action)
+
+    generate_stage2_trajectory_video(
+        cfg=cfg,
+        ckpt_path=ckpt_path,
+        output_video_path=output_video_path,
+        num_episodes=num_episodes,
+        fps=fps,
+        max_steps=max_steps,
+        deterministic_action=deterministic_action,
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Pointmass PyTorch pipeline with CLI commands."
@@ -180,6 +289,32 @@ def build_parser() -> argparse.ArgumentParser:
     p_eval.add_argument("--num-episodes", type=int, default=None, help="Number of episodes for evaluation.")
     p_eval.add_argument("--deterministic-action", action="store_true", help="Use mean action instead of sampling.")
     p_eval.set_defaults(func=cmd_evaluate)
+
+    p_viz_data = subparsers.add_parser("visualize-dataset", help="Generate dataset trajectory video.")
+    p_viz_data.add_argument("--dataset-path", type=str, default=None, help="Input dataset file path.")
+    p_viz_data.add_argument("--output-video", type=str, default=None, help="Output video path.")
+    p_viz_data.add_argument("--num-episodes", type=int, default=None, help="Number of trajectories to render.")
+    p_viz_data.add_argument("--fps", type=int, default=None, help="Video FPS.")
+    p_viz_data.set_defaults(func=cmd_visualize_dataset)
+
+    p_viz_sft = subparsers.add_parser("visualize-stage1", help="Generate stage1 policy trajectory video.")
+    p_viz_sft.add_argument("--ckpt", type=str, default=None, help="Stage1 checkpoint path.")
+    p_viz_sft.add_argument("--output-video", type=str, default=None, help="Output video path.")
+    p_viz_sft.add_argument("--num-episodes", type=int, default=None, help="Number of trajectories to render.")
+    p_viz_sft.add_argument("--fps", type=int, default=None, help="Video FPS.")
+    p_viz_sft.add_argument("--max-steps", type=int, default=None, help="Max rollout steps per episode.")
+    p_viz_sft.add_argument("--deterministic-action", action="store_true", help="Use mean action instead of sampling.")
+    p_viz_sft.set_defaults(func=cmd_visualize_stage1)
+
+    p_viz_stage2 = subparsers.add_parser("visualize-stage2", help="Generate stage2 policy trajectory video.")
+    p_viz_stage2.add_argument("--ckpt", type=str, default=None, help="Stage2 checkpoint path.")
+    p_viz_stage2.add_argument("--output-video", type=str, default=None, help="Output video path.")
+    p_viz_stage2.add_argument("--num-episodes", type=int, default=None, help="Number of trajectories to render.")
+    p_viz_stage2.add_argument("--fps", type=int, default=None, help="Video FPS.")
+    p_viz_stage2.add_argument("--max-steps", type=int, default=None, help="Max rollout steps per episode.")
+    p_viz_stage2.add_argument("--deterministic-action", action="store_true", help="Use mean action instead of sampling.")
+    p_viz_stage2.set_defaults(func=cmd_visualize_stage2)
+
     return parser
 
 
@@ -192,7 +327,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         missing = exc.name if exc.name is not None else str(exc)
         raise SystemExit(
             f"Missing dependency: {missing}. "
-            "Please install required packages, e.g. `pip install torch numpy matplotlib`."
+            "Please install required packages, e.g. `pip install -r requirements.txt`."
         ) from exc
 
 
