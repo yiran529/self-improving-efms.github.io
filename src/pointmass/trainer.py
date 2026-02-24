@@ -531,6 +531,7 @@ def run_sft_training(
     ensure_dirs(cfg["paths"])
     using_distributed, rank, world_size, local_rank, device = _setup_distributed(cfg.get("device", "auto"))
     seed_everything(int(cfg["seed"]) + rank)
+    wandb_run = None
     try:
         payload = load_dataset(dataset_path)
         tuples = payload["tuples"]
@@ -578,6 +579,20 @@ def run_sft_training(
         num_updates = int(cfg["stage1"]["num_updates"])
         eval_interval = int(cfg["stage1"]["eval_interval"])
         train_iter = _infinite(train_loader)
+        wandb_cfg = cfg.get("wandb", {})
+        if _is_main_process(rank) and bool(wandb_cfg.get("enabled", False)):
+            import wandb
+
+            wandb_run = wandb.init(
+                project=wandb_cfg.get("project", "pointmass"),
+                entity=wandb_cfg.get("entity"),
+                name=wandb_cfg.get("name"),
+                group=wandb_cfg.get("group"),
+                tags=list(wandb_cfg.get("tags", [])),
+                mode=wandb_cfg.get("mode", "online"),
+                config=dict(cfg),
+                job_type="stage1",
+            )
 
         if _is_main_process(rank):
             print(
@@ -609,6 +624,18 @@ def run_sft_training(
                         f"train_dist_lp={train_dist_lp:.4f} "
                         f"val_loss={val_metrics['pretrain_loss']:.4f}"
                     )
+                    if wandb_run is not None:
+                        wandb_run.log(
+                            {
+                                "stage1/train_loss": train_loss,
+                                "stage1/train_act_lp": train_act_lp,
+                                "stage1/train_dist_lp": train_dist_lp,
+                                "stage1/val_loss": float(val_metrics["pretrain_loss"]),
+                                "stage1/val_act_lp": float(val_metrics["act_log_prob"]),
+                                "stage1/val_dist_lp": float(val_metrics["dist_log_prob"]),
+                            },
+                            step=step,
+                        )
 
         if _is_main_process(rank):
             save_checkpoint(
@@ -623,6 +650,8 @@ def run_sft_training(
             print(f"[Stage1] checkpoint saved to: {output_ckpt_path}")
         return output_ckpt_path
     finally:
+        if wandb_run is not None:
+            wandb_run.finish()
         _cleanup_distributed(using_distributed)
 
 
@@ -855,6 +884,7 @@ def run_self_improve_training(
     ensure_dirs(cfg["paths"])
     using_distributed, rank, world_size, local_rank, device = _setup_distributed(cfg.get("device", "auto"))
     seed_everything(int(cfg["seed"]) + rank)
+    wandb_run = None
     try:
         env = build_env_from_cfg(cfg)
 
@@ -894,6 +924,20 @@ def run_self_improve_training(
         minibatch_size = int(cfg["stage2"]["minibatch_size"])
         gamma = float(cfg["stage2"]["gamma"])
         max_steps = int(cfg["eval"]["max_steps"])
+        wandb_cfg = cfg.get("wandb", {})
+        if _is_main_process(rank) and bool(wandb_cfg.get("enabled", False)):
+            import wandb
+
+            wandb_run = wandb.init(
+                project=wandb_cfg.get("project", "pointmass"),
+                entity=wandb_cfg.get("entity"),
+                name=wandb_cfg.get("name"),
+                group=wandb_cfg.get("group"),
+                tags=list(wandb_cfg.get("tags", [])),
+                mode=wandb_cfg.get("mode", "online"),
+                config=dict(cfg),
+                job_type="stage2",
+            )
 
         if _is_main_process(rank):
             print(
@@ -952,6 +996,18 @@ def run_self_improve_training(
                     f"return={ret_mean:.2f}+/-{ret_std:.2f} "
                     f"len={len_mean:.2f}+/-{len_std:.2f}"
                 )
+                if wandb_run is not None:
+                    wandb_run.log(
+                        {
+                            "stage2/loss": mean_loss,
+                            "stage2/success_rate": success_rate,
+                            "stage2/return_mean": ret_mean,
+                            "stage2/return_std": ret_std,
+                            "stage2/len_mean": len_mean,
+                            "stage2/len_std": len_std,
+                        },
+                        step=it,
+                    )
 
         if _is_main_process(rank):
             save_checkpoint(
@@ -966,6 +1022,8 @@ def run_self_improve_training(
             print(f"[Stage2] checkpoint saved to: {output_ckpt_path}")
         return output_ckpt_path
     finally:
+        if wandb_run is not None:
+            wandb_run.finish()
         _cleanup_distributed(using_distributed)
 
 

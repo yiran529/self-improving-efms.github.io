@@ -46,6 +46,17 @@
     "minibatch_size": 64,
     "gamma": 0.9
   },
+  "wandb": {
+    "enabled": true,
+    "project": "pointmass",
+    "entity": null,
+    "name": null,
+    "group": null,
+    "tags": [
+      "pointmass"
+    ],
+    "mode": "online"
+  },
   "eval": {
     "num_episodes": 25,
     "max_steps": 140,
