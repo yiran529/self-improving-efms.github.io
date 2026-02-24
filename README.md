@@ -116,6 +116,42 @@ python scripts/run_evaluate.py --config config/default.json
 python scripts/run_visualizations.py --config config/default.json
 ```
 
+## 并行训练入口（DDP）
+
+当前 `stage1` 和 `stage2` 已支持分布式数据并行。推荐用 `torchrun` 启动训练命令。
+
+### 方式 A：直接用主 CLI（推荐）
+
+4 卡示例：
+
+```bash
+torchrun --standalone --nproc_per_node=4 pointmass_notebook.py --config config/default.json train-sft
+torchrun --standalone --nproc_per_node=4 pointmass_notebook.py --config config/default.json train-self-improve
+```
+
+单卡也可用同一入口：
+
+```bash
+torchrun --standalone --nproc_per_node=1 pointmass_notebook.py --config config/default.json train-sft
+torchrun --standalone --nproc_per_node=1 pointmass_notebook.py --config config/default.json train-self-improve
+```
+
+### 方式 B：用 scripts 入口
+
+```bash
+torchrun --standalone --nproc_per_node=4 scripts/run_train_sft.py --config config/default.json
+torchrun --standalone --nproc_per_node=4 scripts/run_train_self_improve.py --config config/default.json
+```
+
+### 关于 run_all
+
+`scripts/run_all.py` 是单进程串行 orchestration（含数据生成、可视化、评估）。  
+并行训练时，推荐流程是：
+
+1. 单进程生成数据（可选连同 dataset 可视化）  
+2. 用 `torchrun` 跑 `train-sft` / `train-self-improve`  
+3. 单进程做可视化和评估
+
 ## 一键全流程
 
 按默认配置串行执行：数据生成 -> 数据可视化 -> Stage1 -> Stage1可视化 -> Stage2 -> Stage2可视化 -> 评估。

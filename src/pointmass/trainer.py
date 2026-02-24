@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import pickle
 from dataclasses import dataclass
 from pathlib import Path
@@ -7,8 +8,11 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from torch.distributions import Categorical, Independent, Normal
+from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data.distributed import DistributedSampler
 
 from .env import Point2D, Point2DConfig, pd_controller
 from .model import TimerNet
@@ -23,6 +27,52 @@ def build_env_from_cfg(cfg: Mapping[str, Any]) -> Point2D:
         success_radius=float(cfg["env"]["success_radius"]),
     )
     return Point2D(env_cfg)
+
+
+def _setup_distributed(device_cfg: str):
+    using_distributed = int(os.environ.get("WORLD_SIZE", "1")) > 1 or dist.is_initialized()
+    if using_distributed and not dist.is_initialized():
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        dist.init_process_group(backend=backend, init_method="env://")
+
+    if using_distributed:
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+            device = torch.device(f"cuda:{local_rank}")
+        else:
+            device = torch.device("cpu")
+    else:
+        rank = 0
+        world_size = 1
+        local_rank = 0
+        device = resolve_device(device_cfg)
+    return using_distributed, rank, world_size, local_rank, device
+
+
+def _cleanup_distributed(using_distributed: bool) -> None:
+    if using_distributed and dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def _is_main_process(rank: int) -> bool:
+    return rank == 0
+
+
+def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
+    if isinstance(model, DistributedDataParallel):
+        return model.module
+    return model
+
+
+def _reduce_mean_scalar(value: float, device: torch.device, using_distributed: bool) -> float:
+    t = torch.tensor(float(value), dtype=torch.float32, device=device)
+    if using_distributed and dist.is_initialized():
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+        t /= dist.get_world_size()
+    return float(t.item())
 
 
 @dataclass
@@ -279,6 +329,9 @@ def _make_train_val_loaders(
     batch_size: int,
     train_ratio: float,
     seed: int,
+    using_distributed: bool = False,
+    rank: int = 0,
+    world_size: int = 1,
 ) -> Tuple[DataLoader, DataLoader]:
     n = obs_vec.shape[0]
     rng = np.random.default_rng(seed)
@@ -302,13 +355,37 @@ def _make_train_val_loaders(
         torch.from_numpy(tts[val_idx]),
     )
 
-    train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True, drop_last=True)
-    val_loader = DataLoader(val_data, batch_size=batch_size, shuffle=False, drop_last=False)
+    if using_distributed:
+        train_sampler = DistributedSampler(
+            train_data,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            drop_last=True,
+            seed=seed,
+        )
+        val_sampler = DistributedSampler(
+            val_data,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=False,
+            drop_last=False,
+        )
+        train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=False, drop_last=True, sampler=train_sampler)
+        val_loader = DataLoader(val_data, batch_size=batch_size, shuffle=False, drop_last=False, sampler=val_sampler)
+    else:
+        train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True, drop_last=True)
+        val_loader = DataLoader(val_data, batch_size=batch_size, shuffle=False, drop_last=False)
     return train_loader, val_loader
 
 
 def _infinite(loader: DataLoader) -> Iterable[Tuple[torch.Tensor, ...]]:
+    epoch = 0
     while True:
+        sampler = getattr(loader, "sampler", None)
+        if sampler is not None and hasattr(sampler, "set_epoch"):
+            sampler.set_epoch(epoch)
+            epoch += 1
         for batch in loader:
             yield batch
 
@@ -339,10 +416,11 @@ def _compute_sft_metrics(
 
 @torch.no_grad()
 def _evaluate_sft(
-    model: TimerNet,
+    model: torch.nn.Module,
     loader: DataLoader,
     converter: DiscreteDistanceConverter,
     device: torch.device,
+    using_distributed: bool = False,
 ) -> Dict[str, float]:
     model.eval()
     total = {"pretrain_loss": 0.0, "act_log_prob": 0.0, "dist_log_prob": 0.0}
@@ -355,6 +433,14 @@ def _evaluate_sft(
         for k in total:
             total[k] += float(metrics[k].item())
         n_batches += 1
+    if using_distributed and dist.is_initialized():
+        for k in total:
+            t = torch.tensor(total[k], dtype=torch.float64, device=device)
+            dist.all_reduce(t, op=dist.ReduceOp.SUM)
+            total[k] = float(t.item())
+        n = torch.tensor(float(n_batches), dtype=torch.float64, device=device)
+        dist.all_reduce(n, op=dist.ReduceOp.SUM)
+        n_batches = int(n.item())
     if n_batches == 0:
         return {k: float("nan") for k in total}
     return {k: v / n_batches for k, v in total.items()}
@@ -362,7 +448,7 @@ def _evaluate_sft(
 
 def save_checkpoint(
     path: Path,
-    model: TimerNet,
+    model: torch.nn.Module,
     optimizer: Optional[torch.optim.Optimizer],
     cfg: Mapping[str, Any],
     norm_stats: NormalizationStats,
@@ -384,7 +470,7 @@ def save_checkpoint(
 
 def load_checkpoint(
     path: Path,
-    model: Optional[TimerNet] = None,
+    model: Optional[torch.nn.Module] = None,
     optimizer: Optional[torch.optim.Optimizer] = None,
     map_location: str = "cpu",
 ) -> Dict[str, Any]:
@@ -429,7 +515,7 @@ def _assert_finite_torch(name: str, tensor: torch.Tensor) -> None:
 
 
 # DEBUG: utility to fail fast when model parameters or gradients become NaN/Inf.
-def _assert_model_finite(model: TimerNet, tag: str) -> None:
+def _assert_model_finite(model: torch.nn.Module, tag: str) -> None:
     for name, param in model.named_parameters():
         _assert_finite_torch(f"{tag}:param:{name}", param.data)
         if param.grad is not None:
@@ -443,87 +529,105 @@ def run_sft_training(
     resume_ckpt_path: Optional[Path] = None,
 ) -> Path:
     ensure_dirs(cfg["paths"])
-    seed_everything(int(cfg["seed"]))
-    device = resolve_device(cfg.get("device", "auto"))
-    payload = load_dataset(dataset_path)
-    tuples = payload["tuples"]
+    using_distributed, rank, world_size, local_rank, device = _setup_distributed(cfg.get("device", "auto"))
+    seed_everything(int(cfg["seed"]) + rank)
+    try:
+        payload = load_dataset(dataset_path)
+        tuples = payload["tuples"]
 
-    norm_stats = NormalizationStats.from_tuples(tuples)
-    converter = DiscreteDistanceConverter(
-        min_distance=float(cfg["distance"]["min_distance"]),
-        max_distance=float(cfg["distance"]["max_distance"]),
-        num_bins=int(cfg["distance"]["num_bins"]),
-    )
+        norm_stats = NormalizationStats.from_tuples(tuples)
+        converter = DiscreteDistanceConverter(
+            min_distance=float(cfg["distance"]["min_distance"]),
+            max_distance=float(cfg["distance"]["max_distance"]),
+            num_bins=int(cfg["distance"]["num_bins"]),
+        )
 
-    obs_vec, act_vec, tts = _build_sft_arrays(tuples, norm_stats)
-    train_loader, val_loader = _make_train_val_loaders(
-        obs_vec=obs_vec,
-        act_vec=act_vec,
-        tts=tts,
-        batch_size=int(cfg["stage1"]["batch_size"]),
-        train_ratio=float(cfg["stage1"]["train_ratio"]),
-        seed=int(cfg["seed"]),
-    )
+        obs_vec, act_vec, tts = _build_sft_arrays(tuples, norm_stats)
+        train_loader, val_loader = _make_train_val_loaders(
+            obs_vec=obs_vec,
+            act_vec=act_vec,
+            tts=tts,
+            batch_size=int(cfg["stage1"]["batch_size"]),
+            train_ratio=float(cfg["stage1"]["train_ratio"]),
+            seed=int(cfg["seed"]),
+            using_distributed=using_distributed,
+            rank=rank,
+            world_size=world_size,
+        )
 
-    model = TimerNet(
-        obs_dim=6,
-        act_dim=2,
-        hidden_sizes=tuple(cfg["model"]["hidden_sizes"]),
-        num_distance_bins=int(cfg["distance"]["num_bins"]),
-        min_act_scale=float(cfg["model"]["min_act_scale"]),
-    ).to(device)
-    optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=float(cfg["stage1"]["learning_rate"]),
-        weight_decay=float(cfg["stage1"]["weight_decay"]),
-        eps=1e-7,
-    )
+        model: torch.nn.Module = TimerNet(
+            obs_dim=6,
+            act_dim=2,
+            hidden_sizes=tuple(cfg["model"]["hidden_sizes"]),
+            num_distance_bins=int(cfg["distance"]["num_bins"]),
+            min_act_scale=float(cfg["model"]["min_act_scale"]),
+        ).to(device)
+        if using_distributed:
+            ddp_kwargs = {"device_ids": [local_rank]} if device.type == "cuda" else {}
+            model = DistributedDataParallel(model, **ddp_kwargs)
+        optimizer = torch.optim.Adam(
+            model.parameters(),
+            lr=float(cfg["stage1"]["learning_rate"]),
+            weight_decay=float(cfg["stage1"]["weight_decay"]),
+            eps=1e-7,
+        )
 
-    if resume_ckpt_path is not None and resume_ckpt_path.exists():
-        load_checkpoint(resume_ckpt_path, model=model, optimizer=optimizer, map_location=str(device))
+        if resume_ckpt_path is not None and resume_ckpt_path.exists():
+            load_checkpoint(resume_ckpt_path, model=_unwrap_model(model), optimizer=optimizer, map_location=str(device))
 
-    num_updates = int(cfg["stage1"]["num_updates"])
-    eval_interval = int(cfg["stage1"]["eval_interval"])
-    train_iter = _infinite(train_loader)
+        num_updates = int(cfg["stage1"]["num_updates"])
+        eval_interval = int(cfg["stage1"]["eval_interval"])
+        train_iter = _infinite(train_loader)
 
-    print(f"[Stage1] device={device}, updates={num_updates}, batch_size={cfg['stage1']['batch_size']}")
-    for step in range(1, num_updates + 1):
-        model.train()
-        obs, action, tts_batch = next(train_iter)
-        obs = obs.to(device)
-        action = action.to(device)
-        tts_batch = tts_batch.to(device)
-
-        optimizer.zero_grad(set_to_none=True)
-        loss, metrics = _compute_sft_metrics(model, obs, action, tts_batch, converter)
-        loss.backward()
-        optimizer.step()
-
-        if step == 1 or step % eval_interval == 0 or step == num_updates:
-            val_metrics = _evaluate_sft(model, val_loader, converter, device)
+        if _is_main_process(rank):
             print(
-                f"[Stage1][{step:05d}] "
-                f"train_loss={metrics['pretrain_loss'].item():.4f} "
-                f"train_act_lp={metrics['act_log_prob'].item():.4f} "
-                f"train_dist_lp={metrics['dist_log_prob'].item():.4f} "
-                f"val_loss={val_metrics['pretrain_loss']:.4f}"
+                f"[Stage1] device={device}, world_size={world_size}, "
+                f"updates={num_updates}, batch_size={cfg['stage1']['batch_size']}"
             )
+        for step in range(1, num_updates + 1):
+            model.train()
+            obs, action, tts_batch = next(train_iter)
+            obs = obs.to(device)
+            action = action.to(device)
+            tts_batch = tts_batch.to(device)
 
-    save_checkpoint(
-        output_ckpt_path,
-        model=model,
-        optimizer=optimizer,
-        cfg=cfg,
-        norm_stats=norm_stats,
-        distance_converter=converter,
-        extra={"stage": "sft", "num_updates": num_updates},
-    )
-    print(f"[Stage1] checkpoint saved to: {output_ckpt_path}")
-    return output_ckpt_path
+            optimizer.zero_grad(set_to_none=True)
+            loss, metrics = _compute_sft_metrics(model, obs, action, tts_batch, converter)
+            loss.backward()
+            optimizer.step()
+
+            if step == 1 or step % eval_interval == 0 or step == num_updates:
+                train_loss = _reduce_mean_scalar(float(metrics["pretrain_loss"].item()), device, using_distributed)
+                train_act_lp = _reduce_mean_scalar(float(metrics["act_log_prob"].item()), device, using_distributed)
+                train_dist_lp = _reduce_mean_scalar(float(metrics["dist_log_prob"].item()), device, using_distributed)
+                val_metrics = _evaluate_sft(model, val_loader, converter, device, using_distributed=using_distributed)
+                if _is_main_process(rank):
+                    print(
+                        f"[Stage1][{step:05d}] "
+                        f"train_loss={train_loss:.4f} "
+                        f"train_act_lp={train_act_lp:.4f} "
+                        f"train_dist_lp={train_dist_lp:.4f} "
+                        f"val_loss={val_metrics['pretrain_loss']:.4f}"
+                    )
+
+        if _is_main_process(rank):
+            save_checkpoint(
+                output_ckpt_path,
+                model=_unwrap_model(model),
+                optimizer=optimizer,
+                cfg=cfg,
+                norm_stats=norm_stats,
+                distance_converter=converter,
+                extra={"stage": "sft", "num_updates": num_updates},
+            )
+            print(f"[Stage1] checkpoint saved to: {output_ckpt_path}")
+        return output_ckpt_path
+    finally:
+        _cleanup_distributed(using_distributed)
 
 
 def _predict_action_and_distance(
-    model: TimerNet,
+    model: torch.nn.Module,
     obs_vec_norm: np.ndarray,
     converter: DiscreteDistanceConverter,
     device: torch.device,
@@ -554,7 +658,7 @@ def _predict_action_and_distance(
 
 def generate_reinforce_dataset(
     env: Point2D,
-    model: TimerNet,
+    model: torch.nn.Module,
     norm_stats: NormalizationStats,
     converter: DiscreteDistanceConverter,
     num_steps: int,
@@ -716,7 +820,7 @@ def generate_reinforce_dataset(
 
 
 def _compute_reinforce_loss(
-    model: TimerNet,
+    model: torch.nn.Module,
     obs: torch.Tensor,
     action: torch.Tensor,
     weight: torch.Tensor,
@@ -749,101 +853,120 @@ def run_self_improve_training(
     output_ckpt_path: Path,
 ) -> Path:
     ensure_dirs(cfg["paths"])
-    seed_everything(int(cfg["seed"]))
-    device = resolve_device(cfg.get("device", "auto"))
-    env = build_env_from_cfg(cfg)
+    using_distributed, rank, world_size, local_rank, device = _setup_distributed(cfg.get("device", "auto"))
+    seed_everything(int(cfg["seed"]) + rank)
+    try:
+        env = build_env_from_cfg(cfg)
 
-    converter = DiscreteDistanceConverter(
-        min_distance=float(cfg["distance"]["min_distance"]),
-        max_distance=float(cfg["distance"]["max_distance"]),
-        num_bins=int(cfg["distance"]["num_bins"]),
-    )
-    model = TimerNet(
-        obs_dim=6,
-        act_dim=2,
-        hidden_sizes=tuple(cfg["model"]["hidden_sizes"]),
-        num_distance_bins=int(cfg["distance"]["num_bins"]),
-        min_act_scale=float(cfg["model"]["min_act_scale"]),
-    ).to(device)
-    optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=float(cfg["stage2"]["learning_rate"]),
-        weight_decay=float(cfg["stage2"]["weight_decay"]),
-        eps=1e-7,
-    )
-
-    init_ckpt = load_checkpoint(init_ckpt_path, model=model, optimizer=optimizer, map_location=str(device))
-    norm_stats = NormalizationStats.from_dict(init_ckpt["normalization"])
-
-    num_iterations = int(cfg["stage2"]["num_iterations"])
-    env_steps_per_batch = int(cfg["stage2"]["env_steps_per_batch"])
-    minibatch_size = int(cfg["stage2"]["minibatch_size"])
-    gamma = float(cfg["stage2"]["gamma"])
-    max_steps = int(cfg["eval"]["max_steps"])
-
-    print(f"[Stage2] device={device}, iterations={num_iterations}, env_steps_per_batch={env_steps_per_batch}")
-    for it in range(1, num_iterations + 1):
-        # DEBUG: assert model parameters are finite before each rollout-data generation.
-        _assert_model_finite(model, f"iter{it:04d}:before_rollout")
-        reinforce_data, ep_stats = generate_reinforce_dataset(
-            env=env,
-            model=model,
-            norm_stats=norm_stats,
-            converter=converter,
-            num_steps=env_steps_per_batch,
-            gamma=gamma,
-            max_steps=max_steps,
-            device=device,
+        converter = DiscreteDistanceConverter(
+            min_distance=float(cfg["distance"]["min_distance"]),
+            max_distance=float(cfg["distance"]["max_distance"]),
+            num_bins=int(cfg["distance"]["num_bins"]),
+        )
+        model: torch.nn.Module = TimerNet(
+            obs_dim=6,
+            act_dim=2,
+            hidden_sizes=tuple(cfg["model"]["hidden_sizes"]),
+            num_distance_bins=int(cfg["distance"]["num_bins"]),
+            min_act_scale=float(cfg["model"]["min_act_scale"]),
+        ).to(device)
+        if using_distributed:
+            ddp_kwargs = {"device_ids": [local_rank]} if device.type == "cuda" else {}
+            model = DistributedDataParallel(model, **ddp_kwargs)
+        optimizer = torch.optim.Adam(
+            model.parameters(),
+            lr=float(cfg["stage2"]["learning_rate"]),
+            weight_decay=float(cfg["stage2"]["weight_decay"]),
+            eps=1e-7,
         )
 
-        ds = TensorDataset(
-            torch.from_numpy(reinforce_data["obs"]),
-            torch.from_numpy(reinforce_data["action"]),
-            torch.from_numpy(reinforce_data["weight"]),
+        init_ckpt = load_checkpoint(
+            init_ckpt_path,
+            model=_unwrap_model(model),
+            optimizer=optimizer,
+            map_location=str(device),
         )
-        loader = DataLoader(ds, batch_size=minibatch_size, shuffle=True, drop_last=True)
+        norm_stats = NormalizationStats.from_dict(init_ckpt["normalization"])
 
-        model.train()
-        losses = []
-        for obs, action, weight in loader:
-            obs = obs.to(device)
-            action = action.to(device)
-            weight = weight.to(device)
+        num_iterations = int(cfg["stage2"]["num_iterations"])
+        env_steps_per_batch = int(cfg["stage2"]["env_steps_per_batch"])
+        local_env_steps_per_batch = max(1, env_steps_per_batch // world_size)
+        minibatch_size = int(cfg["stage2"]["minibatch_size"])
+        gamma = float(cfg["stage2"]["gamma"])
+        max_steps = int(cfg["eval"]["max_steps"])
 
-            optimizer.zero_grad(set_to_none=True)
-            loss = _compute_reinforce_loss(model, obs, action, weight, max_steps=max_steps)
-            loss.backward()
-            # DEBUG: assert gradients are finite immediately after backward.
-            _assert_model_finite(model, f"iter{it:04d}:after_backward")
-            optimizer.step()
-            # DEBUG: assert parameters are finite immediately after optimizer step.
-            _assert_model_finite(model, f"iter{it:04d}:after_step")
-            losses.append(loss.item())
+        if _is_main_process(rank):
+            print(
+                f"[Stage2] device={device}, world_size={world_size}, iterations={num_iterations}, "
+                f"env_steps_per_batch(global)={env_steps_per_batch}, env_steps_per_batch(local)={local_env_steps_per_batch}"
+            )
+        for it in range(1, num_iterations + 1):
+            # DEBUG: assert model parameters are finite before each rollout-data generation.
+            _assert_model_finite(model, f"iter{it:04d}:before_rollout")
+            reinforce_data, ep_stats = generate_reinforce_dataset(
+                env=env,
+                model=model,
+                norm_stats=norm_stats,
+                converter=converter,
+                num_steps=local_env_steps_per_batch,
+                gamma=gamma,
+                max_steps=max_steps,
+                device=device,
+            )
 
-        mean_loss = float(np.mean(losses)) if losses else float("nan")
-        success_rate = float(np.mean(ep_stats["success"]))
-        ret_mean = float(np.mean(ep_stats["return"]))
-        ret_std = float(np.std(ep_stats["return"]))
-        len_mean = float(np.mean(ep_stats["len"]))
-        len_std = float(np.std(ep_stats["len"]))
-        print(
-            f"[Stage2][{it:04d}] "
-            f"loss={mean_loss:.4f} success={success_rate:.3f} "
-            f"return={ret_mean:.2f}+/-{ret_std:.2f} "
-            f"len={len_mean:.2f}+/-{len_std:.2f}"
-        )
+            ds = TensorDataset(
+                torch.from_numpy(reinforce_data["obs"]),
+                torch.from_numpy(reinforce_data["action"]),
+                torch.from_numpy(reinforce_data["weight"]),
+            )
+            loader = DataLoader(ds, batch_size=minibatch_size, shuffle=True, drop_last=True)
 
-    save_checkpoint(
-        output_ckpt_path,
-        model=model,
-        optimizer=optimizer,
-        cfg=cfg,
-        norm_stats=norm_stats,
-        distance_converter=converter,
-        extra={"stage": "self_improve", "num_iterations": num_iterations},
-    )
-    print(f"[Stage2] checkpoint saved to: {output_ckpt_path}")
-    return output_ckpt_path
+            model.train()
+            losses = []
+            for obs, action, weight in loader:
+                obs = obs.to(device)
+                action = action.to(device)
+                weight = weight.to(device)
+
+                optimizer.zero_grad(set_to_none=True)
+                loss = _compute_reinforce_loss(model, obs, action, weight, max_steps=max_steps)
+                loss.backward()
+                # DEBUG: assert gradients are finite immediately after backward.
+                _assert_model_finite(model, f"iter{it:04d}:after_backward")
+                optimizer.step()
+                # DEBUG: assert parameters are finite immediately after optimizer step.
+                _assert_model_finite(model, f"iter{it:04d}:after_step")
+                losses.append(loss.item())
+
+            mean_loss_local = float(np.mean(losses)) if losses else float("nan")
+            mean_loss = _reduce_mean_scalar(mean_loss_local, device, using_distributed)
+            success_rate = _reduce_mean_scalar(float(np.mean(ep_stats["success"])), device, using_distributed)
+            ret_mean = _reduce_mean_scalar(float(np.mean(ep_stats["return"])), device, using_distributed)
+            ret_std = _reduce_mean_scalar(float(np.std(ep_stats["return"])), device, using_distributed)
+            len_mean = _reduce_mean_scalar(float(np.mean(ep_stats["len"])), device, using_distributed)
+            len_std = _reduce_mean_scalar(float(np.std(ep_stats["len"])), device, using_distributed)
+            if _is_main_process(rank):
+                print(
+                    f"[Stage2][{it:04d}] "
+                    f"loss={mean_loss:.4f} success={success_rate:.3f} "
+                    f"return={ret_mean:.2f}+/-{ret_std:.2f} "
+                    f"len={len_mean:.2f}+/-{len_std:.2f}"
+                )
+
+        if _is_main_process(rank):
+            save_checkpoint(
+                output_ckpt_path,
+                model=_unwrap_model(model),
+                optimizer=optimizer,
+                cfg=cfg,
+                norm_stats=norm_stats,
+                distance_converter=converter,
+                extra={"stage": "self_improve", "num_iterations": num_iterations},
+            )
+            print(f"[Stage2] checkpoint saved to: {output_ckpt_path}")
+        return output_ckpt_path
+    finally:
+        _cleanup_distributed(using_distributed)
 
 
 @torch.no_grad()
