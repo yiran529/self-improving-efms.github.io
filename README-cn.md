@@ -1,8 +1,8 @@
-# Pointmass PyTorch Pipeline
+﻿# Pointmass PyTorch Pipeline
 
-This repository refactors the original notebook workflow into a CLI-executable, production-style project structure, supporting single-machine single-device execution (CPU or single GPU).
+本仓库已把原 notebook 流程整理为可命令行运行的工程化结构，支持单机单设备（CPU 或单卡 GPU）。
 
-## Directory Structure
+## 目录结构
 
 ```text
 .
@@ -25,104 +25,100 @@ This repository refactors the original notebook workflow into a CLI-executable, 
 └─ pointmass_notebook.py
 ```
 
-## Installation
+## 安装依赖
 
-Python 3.13 is recommended.
+建议 Python 3.13。
 
 ```bash
 pip install -r requirements.txt
 ```
-
-Or using uv:
-
+或者使用uv：
 ```bash
 uv venv --python 3.13
 uv sync
 ```
 
-## Run Experiments (CLI)
+## 启动实验（CLI）
 
-If using a virtual environment, activate it first, for example:
-
+如果使用了虚拟环境，需要先激活虚拟环境，比如:
 ```bash
 source .venv/bin/activate
 ```
+或者使用`uv run ...`
 
-Or use `uv run ...`
+下面给出标准流程。
 
-Below is the standard workflow.
-
-### 1) Generate Data (PD Controller)
+### 1) 生成数据（PD 控制器）
 
 ```bash
 python pointmass_notebook.py --config config/default.json generate-data
 ```
 
-Quick small-scale debugging:
+快速小样本调试：
 
 ```bash
 python pointmass_notebook.py --config config/default.json generate-data --num-episodes 100
 ```
 
-### 2) Stage 1: Supervised Fine-Tuning (SFT)
+### 2) Stage 1: 监督训练（SFT）
 
 ```bash
 python pointmass_notebook.py --config config/default.json train-sft
 ```
 
-Override the number of training updates:
+可覆盖训练步数：
 
 ```bash
 python pointmass_notebook.py --config config/default.json train-sft --num-updates 200
 ```
 
-### 3) Stage 2: Self-Improvement Training (REINFORCE)
+### 3) Stage 2: 自改进训练（REINFORCE）
 
 ```bash
 python pointmass_notebook.py --config config/default.json train-self-improve
 ```
 
-Override the number of iterations:
+可覆盖迭代数：
 
 ```bash
 python pointmass_notebook.py --config config/default.json train-self-improve --num-iterations 50
 ```
 
-### 4) Evaluation
+### 4) 评估
 
 ```bash
 python pointmass_notebook.py --config config/default.json evaluate
 ```
 
-Use deterministic actions (mean action):
+使用确定性动作（均值动作）：
 
 ```bash
 python pointmass_notebook.py --config config/default.json evaluate --deterministic-action
 ```
 
-### 5) Trajectory Video Visualization (Generate Video Only, No Popup)
+### 5) 轨迹视频可视化（仅生成视频，不弹窗）
 
-Dataset trajectory video:
+数据轨迹视频：
 
 ```bash
 python pointmass_notebook.py --config config/default.json visualize-dataset
 ```
 
-Stage 1 policy trajectory video:
+Stage1 策略轨迹视频：
 
 ```bash
 python pointmass_notebook.py --config config/default.json visualize-stage1
 ```
 
-Stage 2 policy trajectory video:
+Stage2 策略轨迹视频：
 
 ```bash
 python pointmass_notebook.py --config config/default.json visualize-stage2
 ```
 
-## Scripts Entry Points (Optional)
+## scripts 入口（可选）
 
-Equivalent to the commands above:
+与上面命令等价：
 
 ```bash
 python scripts/run_generate_data.py --config config/default.json
@@ -132,87 +128,86 @@ python scripts/run_evaluate.py --config config/default.json
 python scripts/run_visualizations.py --config config/default.json
 ```
 
-## Distributed Training Entry (DDP)
+## 并行训练入口（DDP）
 
-`stage1` and `stage2` now support Distributed Data Parallel (DDP). It is recommended to launch training with `torchrun`.
+当前 `stage1` 和 `stage2` 已支持分布式数据并行。推荐用 `torchrun` 启动训练命令。
 
-### Method A: Use the Main CLI (Recommended)
+### 方式 A：直接用主 CLI（推荐）
 
-Example with 4 GPUs:
+4 卡示例：
 
 ```bash
 torchrun --standalone --nproc_per_node=4 pointmass_notebook.py --config config/default.json train-sft
 torchrun --standalone --nproc_per_node=4 pointmass_notebook.py --config config/default.json train-self-improve
 ```
 
-Single GPU can use the same entry point:
+单卡也可用同一入口：
 
 ```bash
 torchrun --standalone --nproc_per_node=1 pointmass_notebook.py --config config/default.json train-sft
 torchrun --standalone --nproc_per_node=1 pointmass_notebook.py --config config/default.json train-self-improve
 ```
 
-### Method B: Use Scripts Entry
+### 方式 B：用 scripts 入口
 
 ```bash
 torchrun --standalone --nproc_per_node=4 scripts/run_train_sft.py --config config/default.json
 torchrun --standalone --nproc_per_node=4 scripts/run_train_self_improve.py --config config/default.json
 ```
 
-### About run_all
+### 关于 run_all
 
-`scripts/run_all.py` is a single-process sequential orchestration script (including data generation, visualization, and evaluation).
+`scripts/run_all.py` 是单进程串行 orchestration（含数据生成、可视化、评估）。  
+并行训练时，推荐流程是：
 
-For distributed training, the recommended workflow is:
+1. 单进程生成数据（可选连同 dataset 可视化）  
+2. 用 `torchrun` 跑 `train-sft` / `train-self-improve`  
+3. 单进程做可视化和评估
 
-1. Generate data in a single process (optionally including dataset visualization)
-2. Run `train-sft` / `train-self-improve` with `torchrun`
-3. Perform visualization and evaluation in a single process
+## 一键全流程
 
-## One-Click Full Pipeline
-
-Execute sequentially with default configuration: data generation → dataset visualization → Stage1 → Stage1 visualization → Stage2 → Stage2 visualization → evaluation.
+按默认配置串行执行：数据生成 -> 数据可视化 -> Stage1 -> Stage1可视化 -> Stage2 -> Stage2可视化 -> 评估。
 
 ```bash
 python scripts/run_all.py --config config/default.json
 ```
 
-Quick debugging (small scale):
+快速调试（小规模）：
 
 ```bash
 python scripts/run_all.py --config config/default.json --num-episodes 100 --sft-updates 200 --self-improve-iters 20 --eval-episodes 10
 ```
 
-Override video parameters:
+可覆盖视频参数：
 
 ```bash
 python scripts/run_all.py --config config/default.json --vis-episodes 5 --vis-fps 10 --vis-max-steps 140
 ```
 
-Skip certain stages:
+跳过某些阶段：
 
 ```bash
 python scripts/run_all.py --config config/default.json --skip-generate --skip-sft
 ```
 
-## Output Locations
+## 产物位置
 
-* Data: `artifacts/data/pointmass_dataset.pkl`
-* Stage1 checkpoint: `artifacts/checkpoints/sft_last.pt`
-* Stage2 checkpoint: `artifacts/checkpoints/self_improve_last.pt`
-* Dataset video: `artifacts/videos/dataset_trajectories.mp4`
-* Stage1 video: `artifacts/videos/stage1_trajectories.mp4`
-* Stage2 video: `artifacts/videos/stage2_trajectories.mp4`
+- 数据：`artifacts/data/pointmass_dataset.pkl`
+- Stage1 checkpoint：`artifacts/checkpoints/sft_last.pt`
+- Stage2 checkpoint：`artifacts/checkpoints/self_improve_last.pt`
+- Dataset 视频：`artifacts/videos/dataset_trajectories.mp4`
+- Stage1 视频：`artifacts/videos/stage1_trajectories.mp4`
+- Stage2 视频：`artifacts/videos/stage2_trajectories.mp4`
 
-If `ffmpeg` is unavailable in the current environment, the program will automatically fall back to generating a `.gif` file with the same name.
+若当前环境的 `ffmpeg` 不可用，程序会自动回退并生成同名 `.gif` 动图。
 
-You can modify paths and hyperparameters centrally in `config/default.json`.
+可在 `config/default.json` 中统一修改路径和超参数。
 
-## Weights & Biases (W&B) Support
+## Weights & Biases (W&B) 支持
 
-Training supports W&B logging for both Stage 1 and Stage 2.
+训练流程已支持在 Stage1 和 Stage2 中使用 W&B 记录实验信息。
 
-- Enable or disable in `config/default.json` via `wandb.enabled`.
-- Configure `project`, `entity`, `group`, `tags`, and `mode` in the same `wandb` block.
-- Logged metrics include Stage 1 train/val losses and Stage 2 loss, success rate, return, and episode length.
-- Run names are fixed to `stage1` and `stage2`.
+- 在 `config/default.json` 的 `wandb.enabled` 中开启或关闭。
+- 可在同一 `wandb` 配置块中设置 `project`、`entity`、`group`、`tags`、`mode`。
+- 已记录 Stage1 的训练/验证 loss，以及 Stage2 的 loss、success rate、return、episode length。
+- run 名称固定为 `stage1` 和 `stage2`。

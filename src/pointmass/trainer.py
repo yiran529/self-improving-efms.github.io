@@ -586,7 +586,7 @@ def run_sft_training(
             wandb_run = wandb.init(
                 project=wandb_cfg.get("project", "pointmass"),
                 entity=wandb_cfg.get("entity"),
-                name=wandb_cfg.get("name"),
+                name="stage1",
                 group=wandb_cfg.get("group"),
                 tags=list(wandb_cfg.get("tags", [])),
                 mode=wandb_cfg.get("mode", "online"),
@@ -931,7 +931,7 @@ def run_self_improve_training(
             wandb_run = wandb.init(
                 project=wandb_cfg.get("project", "pointmass"),
                 entity=wandb_cfg.get("entity"),
-                name=wandb_cfg.get("name"),
+                name="stage2",
                 group=wandb_cfg.get("group"),
                 tags=list(wandb_cfg.get("tags", [])),
                 mode=wandb_cfg.get("mode", "online"),
