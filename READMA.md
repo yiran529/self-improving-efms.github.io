@@ -15,7 +15,7 @@ This project uses **uv** to manage Python dependencies reproducibly via:
 
 ```bash
 pip install -U uv
-````
+```
 
 ## Install (CPU)
 
@@ -50,6 +50,30 @@ Verify:
 ```bash
 uv run python -c "import jax; print(jax.devices())"
 ```
+
+## Code Compatibility Update
+
+To ensure compatibility with **matplotlib 3.10+**, the following two occurrences in the code:
+
+```python
+### in pointmass_notebook_old.ipynb
+# Convert the rendered image to a numpy array
+width, height = fig.get_size_inches() * fig.get_dpi()
+image = np.frombuffer(canvas.tostring_rgb(), dtype='uint8')
+image = image.reshape(int(height), int(width), 3)
+```
+
+need to be replaced with:
+
+```python
+### in pointmass_notebook_modified.ipynb
+canvas.draw()
+width, height = canvas.get_width_height()
+image = np.frombuffer(canvas.buffer_rgba(), dtype=np.uint8)
+image = image.reshape(height, width, 4)
+image = image[:, :, :3]
+```
+
 
 ---
 
